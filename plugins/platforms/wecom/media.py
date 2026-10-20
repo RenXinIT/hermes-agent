@@ -9,6 +9,8 @@ import hashlib
 import logging
 import mimetypes
 import re
+import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +34,18 @@ ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
+# WeCom native voice bubbles accept AMR only, but TTS providers hand back mp3/wav/ogg. Transcode
+# instead of downgrading to a file attachment — that is the whole difference between a voice bubble
+# and a downloadable file. AMR-NB is 8 kHz mono, so 20 kbps is the native rate; anything higher is
+# wasted bytes against VOICE_MAX_BYTES.
+_AMR_FFMPEG = "/root/opt/ffmpeg-amr/bin/ffmpeg"
+_AMR_CONVERTIBLE = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/aac": ".aac",
+    "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+}
 
 _IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), ((b"GIF87a", b"GIF89a"), ".gif"))
 _MIME_PREFIX_KINDS = (("image/", "image"), ("video/", "video"), ("audio/", "voice"))
@@ -255,9 +269,46 @@ class WeComMediaMixin:
         resolved_name = file_name or local_path.name
         return local_path.read_bytes(), self._normalize_content_type("", resolved_name), resolved_name
 
+    @staticmethod
+    def _transcode_audio_to_amr(data: bytes, source_name: str, content_type: str) -> Optional[tuple[bytes, str]]:
+        """Return AMR bytes + a .amr filename, or None when conversion is not possible.
+
+        Runs ffmpeg in a blocking subprocess; the payloads here are one short TTS clip, so the cost
+        is milliseconds and a thread hop is cheaper than dragging an async process wrapper in.
+        """
+        if not Path(_AMR_FFMPEG).is_file():
+            logger.warning("[wecom] AMR transcode unavailable: %s not found", _AMR_FFMPEG)
+            return None
+        suffix = _AMR_CONVERTIBLE.get(str(content_type or "").split(";", 1)[0].strip().lower()) or Path(source_name).suffix.lower()
+        if suffix not in _AMR_CONVERTIBLE.values():
+            return None
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / f"in{suffix}"
+            dst = Path(tmp) / "out.amr"
+            src.write_bytes(data)
+            # amr_nb is 8 kHz mono by definition; -ar/-ac pin it so a 44.1 kHz source still lands.
+            proc = subprocess.run([_AMR_FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                                   "-ar", "8000", "-ac", "1", "-c:a", "libopencore_amrnb", "-b:a", "20k", str(dst)],
+                                  check=False, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0 or not dst.is_file() or dst.stat().st_size == 0:
+                logger.warning("[wecom] AMR transcode failed (rc=%s): %s", proc.returncode, proc.stderr.strip()[:300])
+                return None
+            amr = dst.read_bytes()
+        base = Path(source_name).stem or "voice"
+        return amr, f"{base}.amr"
+
     async def _prepare_outbound_media(self, media_source: str, file_name: Optional[str] = None) -> dict[str, Any]:
         data, content_type, resolved_name = await self._load_outbound_media(media_source, file_name=file_name)
         detected_type = self._detect_wecom_media_type(content_type)
+        # Audio that is not AMR is still a voice bubble as far as the user is concerned — convert
+        # first, and only fall through to the size limits (which would downgrade it to a file)
+        # if the conversion is genuinely unavailable.
+        if detected_type == "voice" and content_type not in VOICE_SUPPORTED_MIMES:
+            converted = await asyncio.to_thread(self._transcode_audio_to_amr, data, resolved_name, content_type)
+            if converted:
+                data, resolved_name = converted
+                content_type = "audio/amr"
+                detected_type = "voice"
         return {"data": data, "content_type": content_type, "file_name": resolved_name, "detected_type": detected_type, **self._apply_file_size_limits(len(data), detected_type, content_type)}
 
     async def _checked_request(self, cmd: str, body: dict[str, Any], operation: str) -> dict[str, Any]:
